@@ -686,6 +686,67 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --speculative-num-steps 3
 ```
 
+### Qwen3.8-27B on Ascend NPU (text BF16)
+
+Qwen3.8-27B uses the Qwen3.5 hybrid stack: 48 Gated DeltaNet layers and 16
+gated full-attention layers (`full_attention_interval=4`). On Ascend, the
+runtime still selects `hybrid_linear_attn`; pass `--attention-backend mha` so
+the full-attention sub-backend uses the Ascend MHA kernels from
+`tokenspeed-kernel-npu`. GDN ops are served by Triton-Ascend when available,
+with a Torch recurrence fallback registered for Ascend.
+
+This recipe is the text-only BF16 smoke path (no VLM, MTP, or FP8). Prefer a
+local snapshot path after download. Validated bring-up used CANN 8.5.1 / 9.0.0
+compatible stacks with PyTorch 2.9.0 + `torch_npu` 2.9.0 and Triton-Ascend
+3.2.1. Use 4–8 NPUs for weights + hybrid state headroom:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_DISABLE_XET=1
+export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-8.5.1   # or cann-9.0.0
+source "${TOKENSPEED_CANN_ROOT}/set_env.sh"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+
+python -m tokenspeed.cli serve /path/to/Qwen3.8-27B \
+  --served-model-name qwen3.8-27b \
+  --device npu \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
+  --attention-backend mha \
+  --sampling-backend greedy \
+  --tp-size 4 \
+  --disable-prefill-graph \
+  --disable-pdl \
+  --enforce-eager \
+  --max-model-len 4096 \
+  --max-num-seqs 2 \
+  --max-total-tokens 8192 \
+  --chunked-prefill-size 2048 \
+  --prefix-granularity 128 \
+  --disable-autotune \
+  --host 0.0.0.0 \
+  --port 31889
+```
+
+Notes:
+- `--enforce-eager` keeps GDN + full-attention correct during bring-up; after
+  correctness is locked, try removing it and capturing only full-attn decode
+  ACL Graphs the same way as Qwen3-0.6B.
+- Keep `--sampling-backend greedy` and send `temperature=0`.
+- Vision / MTP / 262K context are out of scope for this Ascend recipe.
+
+```bash
+curl http://127.0.0.1:31889/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "用一句话介绍你自己"}],
+    "temperature": 0,
+    "max_tokens": 64
+  }'
+```
+
 ## Qwen3.8 Flash Next
 
 Qwen3.8-Flash-Next is a multimodal MoE model and an early preview of the

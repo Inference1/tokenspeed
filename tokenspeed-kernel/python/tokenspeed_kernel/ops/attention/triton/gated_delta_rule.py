@@ -33,6 +33,10 @@ flashinfer's Hopper+-only decode/MTP kernels (see
 the state pool is large and mutated in place every decode step, so a
 transpose-and-materialize wrapper like the prefill one above would be far too
 expensive here).
+
+Capability vendors include ``ascend`` so Triton-Ascend can select these
+kernels; ``tokenspeed-kernel-npu`` also registers Torch recurrence fallbacks
+for Ascend correctness bring-up.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ from tokenspeed_kernel.signature import format_signatures
     "gdn_chunk_prefill",
     name="triton_gdn_chunk_prefill",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -396,7 +400,7 @@ def _launch_fused_gdn_decode_update(
     "gdn_decode_step",
     name="triton_gdn_decode_step",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -447,7 +451,7 @@ def triton_gdn_decode_step(
     "gdn_decode_mtp",
     name="triton_gdn_decode_mtp",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -614,7 +618,7 @@ def _gdn_replay_commit_kernel(
     "gdn_replay_commit",
     name="triton_gdn_replay_commit",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),

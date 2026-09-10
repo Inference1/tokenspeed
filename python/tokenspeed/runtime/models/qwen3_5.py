@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -966,7 +966,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.mapping = mapping
         self.hidden_size = config.hidden_size
 
-        alt_stream = torch.cuda.Stream()
+        # StreamFork still uses CUDA Event/stream APIs; on Ascend disable the
+        # aux stream (same pattern as models that gate on cuda.is_available()).
+        alt_stream = None if current_platform().is_npu else torch.cuda.Stream()
 
         # Embedding layer
         self.embed_tokens = VocabParallelEmbedding(

@@ -20,10 +20,20 @@
 
 """Single import boundary for the Triton-Ascend distribution."""
 
+from types import SimpleNamespace
+
 import triton
 from triton import language as tl
-from triton import profiler as proton
-from triton.language.extra import libdevice
+
+try:
+    from triton.language.extra import libdevice
+except ImportError:  # pragma: no cover - wheel-dependent
+    libdevice = None
+
+try:
+    from triton import profiler as proton
+except ImportError:  # aarch64 Triton-Ascend wheels may omit profiler
+    proton = None
 
 
 @triton.jit
@@ -32,6 +42,11 @@ def _unsupported_pdl_noop():
     pass
 
 
+# Some Ascend wheels ship without tl.extra.cuda; synthesize a minimal module.
+if not hasattr(tl, "extra"):
+    tl.extra = SimpleNamespace()
+if not hasattr(tl.extra, "cuda"):
+    tl.extra.cuda = SimpleNamespace()
 if not hasattr(tl.extra.cuda, "gdc_wait"):
     tl.extra.cuda.gdc_wait = _unsupported_pdl_noop
 if not hasattr(tl.extra.cuda, "gdc_launch_dependents"):
