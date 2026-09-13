@@ -33,9 +33,14 @@ from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 logger = logging.getLogger(__name__)
+
+# Ascend torch_npu inductor currently breaks on RoPE (KeyError in
+# range_tree_nodes_removed). Keep eager on NPU; CUDA/others still compile.
+_ROPE_COMPILE_DISABLE = current_platform().is_npu
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -88,7 +93,11 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    disable=_ROPE_COMPILE_DISABLE,
+)
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -869,7 +878,11 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    @torch.compile(
+        dynamic=True,
+        backend=get_compiler_backend(),
+        disable=_ROPE_COMPILE_DISABLE,
+    )
     def forward(
         self,
         positions: torch.Tensor,
