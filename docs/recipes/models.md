@@ -667,8 +667,9 @@ Notes:
 
 ### Qwen3.8-27B
 
-A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
-MTP (the draft model path points at the same checkpoint):
+A dense 27B-class Qwen3.8 FP8 checkpoint on a single **NVIDIA GPU**, with
+self-speculative MTP (the draft model path points at the same checkpoint).
+Do **not** use this block on Ascend; see the NPU recipe below.
 
 ```bash
 tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
@@ -689,25 +690,28 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
 ### Qwen3.8-27B on Ascend NPU (text BF16)
 
 Qwen3.8-27B uses the Qwen3.5 hybrid stack: 48 Gated DeltaNet layers and 16
-gated full-attention layers (`full_attention_interval=4`). On Ascend, the
+gated full-attention layers (`full_attention_interval=4`). On Ascend the
 runtime still selects `hybrid_linear_attn`; pass `--attention-backend mha` so
-the full-attention sub-backend uses the Ascend MHA kernels from
-`tokenspeed-kernel-npu`. GDN ops are served by Triton-Ascend when available,
-with a Torch recurrence fallback registered for Ascend.
+full-attention uses Ascend MHA from `tokenspeed-kernel-npu` (including an
+eager path for `head_dim=256`). GDN uses Triton-Ascend when available, with a
+Torch recurrence fallback.
 
-This recipe is the text-only BF16 smoke path (no VLM, MTP, or FP8). Prefer a
-local snapshot path after download. Validated bring-up used CANN 8.5.1 / 9.0.0
-compatible stacks with PyTorch 2.9.0 + `torch_npu` 2.9.0 and Triton-Ascend
-3.2.1. Use 4–8 NPUs for weights + hybrid state headroom:
+This is the **validated text-only BF16** path: no VLM, no MTP, no FP8, no
+TRT-LLM backends. Lab bring-up used CANN 8.5.1, local HF snapshot
+`Qwen/Qwen3.8-27B`, 4 NPUs, `--enforce-eager`.
+
+**One-command serve** (preferred; runs patch probes then launches HTTP):
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
-export HF_HUB_DISABLE_XET=1
-export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-8.5.1   # or cann-9.0.0
-source "${TOKENSPEED_CANN_ROOT}/set_env.sh"
+# After: source CANN set_env.sh + PYTHONPATH (see scripts/README_ascend_qwen38.md)
+export QWEN38_MODEL_PATH=/path/to/Qwen3.8-27B   # local snapshot
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+PORT=31891 bash scripts/ascend_qwen38_smoke.sh --serve
+```
 
+Equivalent explicit CLI (what the smoke script execs):
+
+```bash
 python -m tokenspeed.cli serve /path/to/Qwen3.8-27B \
   --served-model-name qwen3.8-27b \
   --device npu \
@@ -715,29 +719,49 @@ python -m tokenspeed.cli serve /path/to/Qwen3.8-27B \
   --kv-cache-dtype auto \
   --attention-backend mha \
   --sampling-backend greedy \
-  --tp-size 4 \
+  --world-size 4 \
+  --language-model-only \
+  --enforce-eager \
   --disable-prefill-graph \
   --disable-pdl \
-  --enforce-eager \
   --max-model-len 4096 \
   --max-num-seqs 2 \
-  --max-total-tokens 8192 \
+  --max-total-tokens 131072 \
   --chunked-prefill-size 2048 \
   --prefix-granularity 128 \
   --disable-autotune \
   --host 0.0.0.0 \
-  --port 31889
+  --port 31891
 ```
 
+**Verified on Ascend (correctness-first):**
+- `/v1/models` serves `qwen3.8-27b`; `scripts/ascend_qwen38_verify_chat.sh` →
+  `ALL CHAT CHECKS PASSED`
+- Custom accuracy jsonl (`scripts/data/qwen38_accuracy_prompts.jsonl`) with
+  `max_tokens≥256` → `ascend_expect_accuracy=1.0` (7/7); see
+  `docs/platforms/ascend_qwen38_dataset_qa.md`
+- EvalScope **AIME-2025** (`aime25`, `--limit 5`, `max_tokens=2048`,
+  `temperature=0`, greedy): **Accuracy 60%** (3/5). Avg latency ~1004 s/item
+  at ~1.3–1.7 tok/s under `--enforce-eager`. Shorter `max_tokens=256` truncates
+  thinking and scored **0%** — not a fair accuracy run.
+- EvalScope **GPQA Diamond**: same harness (`scripts/ascend_qwen38_evalscope_bench.sh`
+  or ModelScope `AI-ModelScope/gpqa_diamond`); long runs — prefer `tmux` and
+  `--timeout 3600`. Lab score pending a full uninterrupted pass.
+
 Notes:
-- `--enforce-eager` keeps GDN + full-attention correct during bring-up; after
-  correctness is locked, try removing it and capturing only full-attn decode
-  ACL Graphs the same way as Qwen3-0.6B.
-- Keep `--sampling-backend greedy` and send `temperature=0`.
-- Vision / MTP / 262K context are out of scope for this Ascend recipe.
+- Prefer `--world-size` (not the NVIDIA FP8 recipe’s single-GPU MTP stack).
+- `--language-model-only` is required for text checkpoints that share the
+  Qwen3.5 multimodal config surface.
+- `--enforce-eager` keeps GDN + full-attention correct during bring-up; ACL
+  graph / fused MHA-256 / GDN NPU kernels are follow-ups for perf.
+- Keep `--sampling-backend greedy` and client `temperature=0`.
+- Vision, MTP, FP8, and 262K context are **out of scope** on Ascend for this
+  recipe.
 
 ```bash
-curl http://127.0.0.1:31889/v1/chat/completions \
+PORT=31891 bash scripts/ascend_qwen38_verify_chat.sh
+# or:
+curl http://127.0.0.1:31891/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "qwen3.8-27b",
