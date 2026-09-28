@@ -1,174 +1,167 @@
-# Ascend Qwen3.8-27B — 推理适配说明（TokenSpeed / vLLM-Ascend）
+# Ascend Qwen3.8-27B — bring-up notes (TokenSpeed / vLLM-Ascend)
 
-## 当前正确位置（2026-09-16）
+## Current lab layout (2026-09-28)
 
-| 项 | 正确值 |
-|----|--------|
-| 机器 | `178.136.2.2` |
-| 容器 | `vllm_ascend_dev` |
-| 进容器 | **`nsenter`（不要 `docker exec`）** — 本机 Docker 会报 `OCI runtime state … init_process_start` |
-| 当前 API | **vLLM-Ascend** · `http://127.0.0.1:31911/v1` · 模型名 `qwen3.8-27b` |
-| 卡 | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7`（容器内 TP=4） |
-| 客户端 | 必须与 serve **同一网络命名空间**（再 `nsenter` 一次，或用容器 IP）；宿主机上 `curl 127.0.0.1:31911` 会 `Failed to connect` |
-| 客户端 Python | `ts_venv` 可以（只做 HTTP / EvalScope）；**不要**在 `ts_venv` 里起 vLLM |
+| Item | Value |
+|------|--------|
+| Host | `178.136.2.2` |
+| Container | `vllm_ascend_dev` |
+| Enter container | Prefer `docker exec -it vllm_ascend_dev bash`. If host Docker returns `OCI runtime state … init_process_start`, use `nsenter` (see below). |
+| Active API | **vLLM-Ascend** · `http://127.0.0.1:31911/v1` · served name `qwen3.8-27b` |
+| NPUs | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` (TP=4 inside the container) |
+| Client | Must share the serve network namespace (`docker exec` / `nsenter`), or use the container IP. Host-side `curl 127.0.0.1:31911` fails if the server is not published on the host netns. |
+| Client Python | `aisbench_venv` / `ts_venv` for HTTP clients and EvalScope/AISBench only — do **not** start vLLM from `ts_venv`. |
 
 ```bash
-# 宿主机 → 容器（客户端 / 再开终端都用这个）
+# Host → container
 ssh root@178.136.2.2
-PID=$(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev)
-nsenter -t "$PID" -m -u -i -n -p bash
+docker start vllm_ascend_dev
+docker exec -it vllm_ascend_dev bash
+# Fallback if docker exec is broken on this host:
+# PID=$(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev)
+# nsenter -t "$PID" -m -u -i -n -p bash
 
-export PATH="/usr/local/python3.11.14/bin:$PATH"
+export PATH="/usr/local/python3.12.13/bin:$PATH"
 source /usr/local/Ascend/cann-8.5.1/set_env.sh
-# 若只跑 EvalScope / curl，可用 TokenSpeed venv：
-# source /home/tokenspeed_ws/ts_venv/bin/activate
-cd /home/tokenspeed_ws/tokenspeed
+cd /home/tokenspeed_ws/tokenspeed   # or /home/AISBench for AISBench
 
 curl -sS http://127.0.0.1:31911/v1/models | head
-PORT=31911 bash scripts/ascend_qwen38_verify_chat.sh   # 脚本只认 PORT，与引擎无关
+PORT=31911 bash scripts/ascend_qwen38_verify_chat.sh
 ```
 
-宿主机侧备选（不进 netns 时）：
+Host-side alternative (when not sharing netns):
 
 ```bash
 CIP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vllm_ascend_dev)
 curl -sS "http://${CIP}:31911/v1/models" | head
-# EvalScope: 把 api_url 设为 http://${CIP}:31911/v1
+# Point EvalScope/AISBench api_url at http://${CIP}:31911/v1
 ```
 
-说明：当前 vLLM 路径因系统 Triton NPU driver=0，已打本地绕路（Torch gated LN + `patch_qwen3_5` 强制 eager full-attn）。能推理；加速需重装可用的 `triton-ascend`。
+Aligned AISBench accuracy client (thinking / `reasoning_effort=xhigh` top-level,
+`max_out_len=32768`, server `max-model-len=131072`) lives under the lab AISBench
+checkout; see measured scores in `docs/recipes/models.md`.
 
 ---
 
-## TokenSpeed 路径（31891，可选）
+## TokenSpeed path (port 31891, optional)
 
-此前 TokenSpeed 冒烟（2026-09-13）仍有效，卡 `0,1,2,3`、端口 **31891**：
+Earlier TokenSpeed smoke (2026-09-13) remains valid on NPUs `0,1,2,3`, port **31891**:
 
-| 项 | 结果 |
-|----|------|
-| 引擎 | TokenSpeed（`--device npu`，eager） |
-| 模型 | `Qwen3.8-27B`（HF snapshot `1d4bf0f2…`） |
-| 并行 | `world-size=4`（`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`） |
-| API | `http://127.0.0.1:31891/v1` |
-| 形态 | `--language-model-only` |
+| Item | Result |
+|------|--------|
+| Engine | TokenSpeed (`--device npu`, eager by default) |
+| Model | `Qwen3.8-27B` (HF snapshot `1d4bf0f2…`) |
+| Parallel | `world-size=4` (`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`) |
+| Mode | `--language-model-only` |
 
-- `PORT=31891 bash scripts/ascend_qwen38_verify_chat.sh` → **`ALL CHAT CHECKS PASSED`**
+Responses may include thinking / `</think>`; smoke checks content, not HF greedy
+token match.
 
-回复中常有 thinking + `</think>`；冒烟按内容判定，不等于 HF greedy 对齐。
-
-**尚未声称的正式精度/性能数字**：需 HF greedy 基线 + HTTP bench。
-
----
-
-## 建议截图保存（交付证据）
-
-请在本地建目录（示例）`docs/evidence/ascend_qwen38_2026-09-13/`，至少保存：
-
-1. **环境** — `npu-smi info`；`docker ps` 含 `vllm_ascend_dev`
-2. **服务就绪** — serve 日志；`curl http://127.0.0.1:31911/v1/models`（当前）或 `:31891`（TokenSpeed）
-3. **功能冒烟** — `PORT=31911`（或 `31891`）`verify_chat` / 一次 chat JSON
-4. **精度** — `/tmp/qwen38_acc_compare.json` 的 `summary`
-5. **性能** — `ascend_qwen38_bench_http` 的 `SUMMARY`
+**Not claimed here:** formal HF-aligned accuracy or peak tok/s — run the accuracy
+and HTTP bench scripts separately.
 
 ---
 
-## 日常起停
+## Suggested evidence screenshots
 
-### 进容器（唯一推荐）
+Keep under e.g. `docs/evidence/ascend_qwen38_YYYY-MM-DD/`:
+
+1. **Environment** — `npu-smi info`; `docker ps` showing `vllm_ascend_dev`
+2. **Serve ready** — serve log; `curl http://127.0.0.1:31911/v1/models` (or `:31891`)
+3. **Functional smoke** — `PORT=31911` (or `31891`) `verify_chat` / one chat JSON
+4. **Accuracy** — AISBench/EvalScope summary, or `/tmp/qwen38_acc_compare.json`
+5. **Perf** — `ascend_qwen38_bench_http` `SUMMARY`
+
+---
+
+## Daily start / stop
+
+### Enter container
 
 ```bash
-ssh root@178.136.2.2
-PID=$(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev)
-nsenter -t "$PID" -m -u -i -n -p bash
-# 不要用: docker exec -it vllm_ascend_dev bash   # 本机会 OCI 失败
+docker start vllm_ascend_dev
+docker exec -it vllm_ascend_dev bash
+# Fallback:
+# PID=$(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev)
+# nsenter -t "$PID" -m -u -i -n -p bash
 ```
 
-### A) 当前：vLLM-Ascend（31911，卡 4–7）
+### A) Current: vLLM-Ascend (31911, NPUs 4–7)
 
-在 **nsenter 后的终端**（系统 Python，非 ts_venv 起服）：
+Inside the container (system Python / image vLLM, not `ts_venv`):
 
 ```bash
-export PATH="/usr/local/python3.11.14/bin:$PATH"
-source /usr/local/Ascend/cann-8.5.1/set_env.sh
+export PATH=/usr/local/python3.12.13/bin:$PATH
 export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export QWEN38_MODEL_PATH=/root/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
-
-vllm serve "$QWEN38_MODEL_PATH" \
-  --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port 31911 \
-  --tensor-parallel-size 4 \
-  --dtype bfloat16 \
-  --max-model-len 8192 \
-  --trust-remote-code \
-  --gpu-memory-utilization 0.85 \
-  --enforce-eager \
-  --language-model-only \
-  2>&1 | tee /tmp/vllm_qwen38_serve.log
+MODEL=/root/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+# See lab nohup recipe: --max-model-len 131072, TP=4, port 31911
 ```
 
-另一终端同样 `nsenter` 后：
+In another container shell:
 
 ```bash
 curl -sS http://127.0.0.1:31911/v1/models | head
 ```
 
-### B) TokenSpeed（31891，卡 0–3）
+### B) TokenSpeed (31891, NPUs 0–3)
 
 ```bash
 source /home/tokenspeed_ws/ts_venv/bin/activate
-cd /home/tokenspeed_ws/tokenspeed
 export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-8.5.1
 source "${TOKENSPEED_CANN_ROOT}/set_env.sh"
+cd /home/tokenspeed_ws/tokenspeed
 export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export QWEN38_MODEL_PATH=/root/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
-
 PORT=31891 bash scripts/ascend_qwen38_smoke.sh --serve
 ```
 
-验证：
+Verify:
 
 ```bash
-source /home/tokenspeed_ws/ts_venv/bin/activate
-cd /home/tokenspeed_ws/tokenspeed
-curl -sS http://127.0.0.1:31891/v1/models | head
 PORT=31891 bash scripts/ascend_qwen38_verify_chat.sh
 ```
 
 ---
 
-## 关键 Ascend 补丁 / 行为（合 PR 时对照）
+## Key Ascend patches / behavior (PR checklist)
 
-| 位置 | 作用 |
-|------|------|
-| `tokenspeed-kernel-npu/.../ops/mha.py` | `head_dim=256` 优先 BNSD FIA，失败回退 eager |
-| `tokenspeed-kernel-npu/.../ops/gdn_npu.py` | Ascend GDN CANN/vectorized；Torch fallback 保留 |
-| `tokenspeed-kernel/.../attention/ascend.py` | 注册 `ascend_npu_gdn_*` (PERFORMANT+2) |
-| `python/.../models/qwen3_5.py` | NPU 跳过 `fused_qk_rmsnorm_rope_gate` |
-| `tokenspeed-kernel/.../ops/kvcache/triton.py` | NPU `zero_byte_ranges` 用 `tensor.zero_()` |
-| `python/.../kv_cache/recipes/qwen35.py` | GDN parent/`token_capacity` 正确 sizing |
-| `python/.../layers/rotary_embedding.py` | NPU 关闭 RoPE `torch.compile`（Inductor KeyError） |
-| `python/.../execution/model_executor.py` | NPU 跳过 RSAG prewarm |
-| `python/.../layers/logits_processor.py` | 禁止在无 CUDA 时调用 `is_current_stream_capturing` |
-| 已安装 `tokenspeed-scheduler` | 须与 Python 同 ABI（`block_granularity`）；改 C++ 后需 `pip install -e` |
+| Location | Role |
+|----------|------|
+| `tokenspeed-kernel-npu/.../ops/mha.py` | Prefer BNSD FIA for `head_dim=256`; eager fallback |
+| `tokenspeed-kernel-npu/.../ops/gdn_npu.py` | Ascend GDN CANN/vectorized path; Torch fallback kept |
+| `tokenspeed-kernel/.../attention/ascend.py` | Register `ascend_npu_gdn_*` (PERFORMANT+2) |
+| `python/.../models/qwen3_5.py` | Skip `fused_qk_rmsnorm_rope_gate` on NPU when needed |
+| `tokenspeed-kernel/.../ops/kvcache/triton.py` | NPU `zero_byte_ranges` via `tensor.zero_()` |
+| `python/.../kv_cache/recipes/qwen35.py` | Correct GDN parent / `token_capacity` sizing |
+| `python/.../layers/rotary_embedding.py` | Disable RoPE `torch.compile` on NPU |
+| `python/.../execution/model_executor.py` | Skip RSAG prewarm on NPU |
+| `python/.../layers/logits_processor.py` | Do not call `is_current_stream_capturing` without CUDA |
+| Installed `tokenspeed-scheduler` | Must match Python ABI (`block_granularity`); reinstall editable after C++ changes |
 
-**整树同步**时请同时带上：`python/tokenspeed`、`tokenspeed-kernel/python`、`tokenspeed-kernel-npu/python`、`tokenspeed-scheduler`（若 ABI 变了要重编）、`scripts`。不要只 scp 单个 `triton.py`。
-
----
-
-## 精度 / 性能
-
-- **标准 benchmark（推荐）**：EvalScope `aime25` + `gpqa_diamond`（与 CI 同数据集，默认小 limit）  
-  `PORT=31891 bash scripts/ascend_qwen38_evalscope_bench.sh`  
-- 精度对齐：CUDA 机 HF greedy → 昇腾 `ascend_qwen38_accuracy.sh` → `mean_token_match_rate`  
-- 性能：`scripts/ascend_qwen38_bench_http.sh`（勿用 accuracy jsonl 当 perf）  
-- 详见 `scripts/README_ascend_qwen38.md`
+When syncing the tree, ship together: `python/tokenspeed`, `tokenspeed-kernel/python`,
+`tokenspeed-kernel-npu/python`, `tokenspeed-scheduler` (rebuild if ABI changes),
+and `scripts`. Do not scp a single `triton.py` in isolation.
 
 ---
 
-## 已知限制
+## Accuracy / performance
 
-- 默认仍 **正确性优先**（`--enforce-eager`）。GDN/`mha` D=256 已接 NPU 高性能路径；用 `ASCEND_ALLOW_GRAPH=1` + 另端口 `bench_http` 做 ACL graph A/B，勿打断 31891 全量评测。  
+- **Preferred full accuracy**: AISBench against vLLM-Ascend (`gpqa_gen_0_shot_str`,
+  `aime2025_gen_0_shot_chat_prompt`) with `reasoning_effort=xhigh` (request top-level).
+- **CI-aligned small EvalScope**: `aime25` + `gpqa_diamond` — see
+  `scripts/README_ascend_qwen38.md`.
+- Token match vs HF: CUDA HF greedy → Ascend `ascend_qwen38_accuracy.sh` →
+  `mean_token_match_rate`.
+- Perf: `scripts/ascend_qwen38_bench_http.sh` (do not treat accuracy jsonl as perf).
 
-- Chat 可能带 thinking 风格文本；判分/比 token 前建议关 thinking 或剥 `</think>`。  
-- 输出质量与 HF 对齐数字需单独测，不能仅凭冒烟通过声称「精度达标」。
+---
+
+## Known limits
+
+- Default recipe stays **correctness-first** (`--enforce-eager` on TokenSpeed).
+  GDN / MHA `D=256` NPU paths exist; use `ASCEND_ALLOW_GRAPH=1` on a free port for
+  ACL-graph A/B without interrupting a long accuracy run.
+- Chat may emit thinking text; disable thinking or strip `</think>` before scoring
+  when the harness expects final answers only.
+- Do not claim HF-matched accuracy from smoke alone.
