@@ -13,6 +13,7 @@
 #   WORLD_SIZE         default 4
 #   PORT               default 31891
 #   MAX_TOTAL_TOKENS   default 131072
+#   ASCEND_ALLOW_GRAPH=1  drop --enforce-eager (non-31891 A/B only; keep disable-prefill-graph)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -61,8 +62,13 @@ root = Path(".")
 checks = [
     (
         root / "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/mha.py",
-        "_TND_SUPPORTED_HEAD_DIMS",
-        "eager MHA for head_dim=256",
+        "_BNSD_256_OK",
+        "BNSD FIA path for head_dim=256",
+    ),
+    (
+        root / "tokenspeed-kernel-npu/python/tokenspeed_kernel_npu/ops/gdn_npu.py",
+        "npu_chunk_gated_delta_rule",
+        "Ascend GDN NPU / vectorized path",
     ),
     (
         root / "python/tokenspeed/runtime/models/qwen3_5.py",
@@ -102,25 +108,27 @@ plat = current_platform()
 print("platform", plat.vendor, "is_npu", plat.is_npu)
 for mode in ("gdn_chunk_prefill", "gdn_decode_step", "mha_prefill"):
     specs = reg.get_for_operator("attention", mode, platform=plat)
-    print(mode, [(s.name, s.solution, int(s.priority)) for s in specs[:4]])
+    print(mode, [(s.name, s.solution, int(s.priority)) for s in specs[:6]])
 PY
 
 echo "== CPU torch GDN tests =="
-"${PYTHON_BIN}" -m pytest -q tokenspeed-kernel-npu/test/test_gdn_torch_cpu.py
+"${PYTHON_BIN}" -m pytest -q \
+  tokenspeed-kernel-npu/test/test_gdn_torch_cpu.py \
+  tokenspeed-kernel-npu/test/test_gdn_npu_cpu.py
 
 if "${PYTHON_BIN}" -c "import torch, torch_npu; assert torch.npu.is_available()"; then
   echo "== NPU GDN tests (best-effort) =="
   "${PYTHON_BIN}" -m pytest -q tokenspeed-kernel-npu/test/test_gdn.py || true
-  echo "== NPU MHA eager path smoke =="
+  echo "== NPU MHA head_dim=256 smoke =="
   "${PYTHON_BIN}" - <<'PY'
 import torch
 import torch_npu  # noqa: F401
+from tokenspeed_kernel_npu.ops import mha as mha_mod
 from tokenspeed_kernel_npu.ops.mha import mha_prefill, _needs_eager
 
 q = torch.randn(4, 2, 256, device="npu", dtype=torch.bfloat16)
 k = torch.randn(4, 1, 256, device="npu", dtype=torch.bfloat16)
 v = torch.randn(4, 1, 256, device="npu", dtype=torch.bfloat16)
-assert _needs_eager(q), "head_dim=256 must use eager"
 out = mha_prefill(
     q, k, v,
     cu_seqlens=torch.tensor([0, 4], device="npu", dtype=torch.int32),
@@ -128,7 +136,18 @@ out = mha_prefill(
     max_seqlen=4,
 )
 assert out.shape == q.shape, out.shape
-print("mha_prefill eager ok", tuple(out.shape), float(out.float().abs().mean()))
+# After call, D=256 either fused (probe True → not eager) or eager fallback.
+assert mha_mod._BNSD_256_OK is not None
+print(
+    "mha_prefill D=256 ok",
+    tuple(out.shape),
+    "bnsd_ok",
+    mha_mod._BNSD_256_OK,
+    "needs_eager",
+    _needs_eager(q),
+    "mean",
+    float(out.float().abs().mean()),
+)
 PY
 else
   echo "NPU not available; skipped device tests"
@@ -141,16 +160,20 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-131072}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+ASCEND_ALLOW_GRAPH="${ASCEND_ALLOW_GRAPH:-0}"
 
 if [[ "${DO_SERVE}" -ne 1 ]]; then
   echo
   echo "Probe/tests done. To launch serve:"
   echo "  QWEN38_MODEL_PATH=${MODEL_PATH} bash scripts/ascend_qwen38_smoke.sh --serve"
-  echo "Perf A/B examples:"
-  echo "  WORLD_SIZE=2 MAX_NUM_SEQS=4 MAX_MODEL_LEN=2048 PORT=31891 bash scripts/ascend_qwen38_smoke.sh --serve"
-  echo "Then in another shell:"
-  echo "  PORT=${PORT} bash scripts/ascend_qwen38_verify_chat.sh"
-  echo "  PORT=${PORT} bash scripts/ascend_qwen38_bench_http.sh"
+  echo "Perf A/B (do NOT use PORT=31891 while AIME full is running):"
+  echo "  # baseline eager:"
+  echo "  PORT=31901 ASCEND_ALLOW_GRAPH=0 bash scripts/ascend_qwen38_smoke.sh --serve"
+  echo "  # relaxed graph (narrow enforce-eager):"
+  echo "  PORT=31902 ASCEND_ALLOW_GRAPH=1 bash scripts/ascend_qwen38_smoke.sh --serve"
+  echo "Then:"
+  echo "  PORT=31901 bash scripts/ascend_qwen38_bench_http.sh"
+  echo "  PORT=31902 bash scripts/ascend_qwen38_bench_http.sh"
   exit 0
 fi
 
@@ -159,7 +182,17 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
-echo "== serve ${MODEL_PATH} port=${PORT} world_size=${WORLD_SIZE} max_model_len=${MAX_MODEL_LEN} max_num_seqs=${MAX_NUM_SEQS} =="
+EAGER_ARGS=()
+if [[ "${ASCEND_ALLOW_GRAPH}" != "1" ]]; then
+  EAGER_ARGS+=(--enforce-eager)
+else
+  echo "ASCEND_ALLOW_GRAPH=1: omitting --enforce-eager (still disable-prefill-graph / disable-pdl)"
+  if [[ "${PORT}" == "31891" ]]; then
+    echo "WARNING: PORT=31891 is the lab AIME port — prefer 3190x for graph A/B" >&2
+  fi
+fi
+
+echo "== serve ${MODEL_PATH} port=${PORT} world_size=${WORLD_SIZE} max_model_len=${MAX_MODEL_LEN} max_num_seqs=${MAX_NUM_SEQS} allow_graph=${ASCEND_ALLOW_GRAPH} =="
 exec "${PYTHON_BIN}" -m tokenspeed.cli serve "${MODEL_PATH}" \
   --served-model-name qwen3.8-27b \
   --device npu \
@@ -169,7 +202,7 @@ exec "${PYTHON_BIN}" -m tokenspeed.cli serve "${MODEL_PATH}" \
   --sampling-backend greedy \
   --world-size "${WORLD_SIZE}" \
   --language-model-only \
-  --enforce-eager \
+  "${EAGER_ARGS[@]}" \
   --disable-prefill-graph \
   --disable-pdl \
   --max-model-len "${MAX_MODEL_LEN}" \

@@ -53,7 +53,7 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     ).to(x.dtype)
 
 
-@pytest.mark.parametrize("solution", ["torch", "triton"])
+@pytest.mark.parametrize("solution", ["torch", "torch_npu", "triton"])
 def test_gdn_chunk_prefill_matches_torch_oracle(solution: str) -> None:
     if gdn_chunk_prefill is None:
         pytest.skip("tokenspeed_kernel registry unavailable")
@@ -93,8 +93,8 @@ def test_gdn_chunk_prefill_matches_torch_oracle(solution: str) -> None:
             solution=solution,
         )
     except Exception as exc:  # pragma: no cover - solution may be unavailable
-        if solution == "triton":
-            pytest.skip(f"triton GDN unavailable on this Ascend stack: {exc}")
+        if solution in ("triton", "torch_npu"):
+            pytest.skip(f"{solution} GDN unavailable on this Ascend stack: {exc}")
         raise
 
     assert isinstance(result, GdnChunkPrefillResult)
@@ -118,7 +118,8 @@ def test_gdn_chunk_prefill_matches_torch_oracle(solution: str) -> None:
     )
 
 
-def test_gdn_decode_step_torch_updates_pool() -> None:
+@pytest.mark.parametrize("solution", ["torch", "torch_npu"])
+def test_gdn_decode_step_updates_pool(solution: str) -> None:
     if gdn_decode_step is None:
         pytest.skip("tokenspeed_kernel registry unavailable")
     torch.manual_seed(7)
@@ -146,21 +147,49 @@ def test_gdn_decode_step_torch_updates_pool() -> None:
     scale = head_dim**-0.5
 
     pool_before = pool.clone()
-    out = gdn_decode_step(
-        q,
-        k,
-        v,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        initial_state=pool,
-        initial_state_indices=read_idx,
-        scale=scale,
-        use_qk_l2norm=True,
-        solution="torch",
-    )
+    try:
+        out = gdn_decode_step(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=pool,
+            initial_state_indices=read_idx,
+            scale=scale,
+            use_qk_l2norm=True,
+            solution=solution,
+        )
+    except Exception as exc:  # pragma: no cover
+        if solution == "torch_npu":
+            pytest.skip(f"torch_npu GDN decode unavailable: {exc}")
+        raise
     assert out.shape == v.shape
     assert not torch.equal(pool[read_idx], pool_before[read_idx])
     untouched = torch.tensor([0, 2, 4, 5, 6, 7], device=device)
     torch.testing.assert_close(pool[untouched], pool_before[untouched])
+
+    if solution == "torch_npu":
+        pool_ref = pool_before.clone()
+        out_ref = torch_gdn.gdn_decode_step(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=pool_ref,
+            initial_state_indices=read_idx,
+            scale=scale,
+            use_qk_l2norm=True,
+        )
+        torch.testing.assert_close(out.float(), out_ref.float(), rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            pool[read_idx].float(),
+            pool_ref[read_idx].float(),
+            rtol=3e-2,
+            atol=3e-2,
+        )

@@ -692,13 +692,16 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
 Qwen3.8-27B uses the Qwen3.5 hybrid stack: 48 Gated DeltaNet layers and 16
 gated full-attention layers (`full_attention_interval=4`). On Ascend the
 runtime still selects `hybrid_linear_attn`; pass `--attention-backend mha` so
-full-attention uses Ascend MHA from `tokenspeed-kernel-npu` (including an
-eager path for `head_dim=256`). GDN uses Triton-Ascend when available, with a
-Torch recurrence fallback.
+full-attention uses Ascend MHA from `tokenspeed-kernel-npu` (BNSD FIA for
+`head_dim=256` when the CANN probe succeeds, else eager). GDN prefers
+`solution=torch_npu` (`gdn_npu`: CANN chunk/recurrent when available, else
+vectorized Torch); the original token-loop Torch kernels remain a PORTABLE
+fallback. Registry ideas adapted from Apache-2.0 vLLM-Ascend — TokenSpeed
+scheduler is unchanged.
 
 This is the **validated text-only BF16** path: no VLM, no MTP, no FP8, no
 TRT-LLM backends. Lab bring-up used CANN 8.5.1, local HF snapshot
-`Qwen/Qwen3.8-27B`, 4 NPUs, `--enforce-eager`.
+`Qwen/Qwen3.8-27B`, 4 NPUs, `--enforce-eager` by default.
 
 **One-command serve** (preferred; runs patch probes then launches HTTP):
 
@@ -755,11 +758,15 @@ Notes:
 - Prefer `--world-size` (not the NVIDIA FP8 recipe’s single-GPU MTP stack).
 - `--language-model-only` is required for text checkpoints that share the
   Qwen3.5 multimodal config surface.
-- `--enforce-eager` keeps GDN + full-attention correct during bring-up; ACL
-  graph / fused MHA-256 / GDN NPU kernels are follow-ups for perf.
+- Default `--enforce-eager` remains the correctness recipe. For tok/s A/B on a
+  **free** port (not 31891 while AIME runs):  
+  `PORT=31902 ASCEND_ALLOW_GRAPH=1 bash scripts/ascend_qwen38_smoke.sh --serve`  
+  then `PORT=31902 bash scripts/ascend_qwen38_bench_http.sh`. RoPE stays off
+  `torch.compile` on NPU; RSAG prewarm stays skipped; prefill graph stays off.
 - Keep `--sampling-backend greedy` and client `temperature=0`.
 - Vision, MTP, FP8, and 262K context are **out of scope** on Ascend for this
   recipe.
+- Gap / API map: `docs/platforms/ascend_qwen38_27b_gap.md`.
 
 ```bash
 PORT=31891 bash scripts/ascend_qwen38_verify_chat.sh

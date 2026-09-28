@@ -1,6 +1,7 @@
 # Ascend Qwen3.8-27B 小数据集问答整理
 
-- **服务**：TokenSpeed Ascend · `http://127.0.0.1:31891/v1` · 模型 `qwen3.8-27b`
+- **服务（历史实测）**：TokenSpeed Ascend · `http://127.0.0.1:31891/v1` · 模型 `qwen3.8-27b`
+- **当前（2026-09-16）**：vLLM-Ascend · 容器 `vllm_ascend_dev`（`nsenter` 进入）· `http://127.0.0.1:31911/v1` · 卡 `4,5,6,7`；客户端须与 serve 同一 netns，见 `ascend_qwen38_sync.md`
 - **任务集**：`scripts/data/qwen38_accuracy_prompts.jsonl`（8 题）
 - **实测轮次**：加长生成 `max_tokens≥256`（`/tmp/qwen38_prompts_eval.jsonl`）
 - **结果文件**：`/tmp/qwen38_ascend_dataset_long.json`
