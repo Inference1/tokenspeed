@@ -67,6 +67,17 @@ def fused_gdn_gating(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> torch.Tensor:
+    # Ascend / non-CUDA: Triton path embeds CUDA PDL extras and SIGSEGVs.
+    if a.device.type != "cuda":
+        x = a.float() + dt_bias.float()
+        beta_x = beta * x
+        softplus_x = torch.where(
+            beta_x <= threshold,
+            (1.0 / beta) * torch.log1p(torch.exp(beta_x)),
+            x,
+        )
+        return (-torch.exp(A_log.float()) * softplus_x).to(dtype=torch.float32)
+
     enable_pdl = pdl_enabled()
     batch, num_heads = a.shape
     seq_len = 1

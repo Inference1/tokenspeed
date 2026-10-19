@@ -16,6 +16,7 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    CacheLayout,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
@@ -89,6 +90,30 @@ class QwenGDNRecipe(CacheRecipe):
         if num_full_attention == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
         return 1.0 + 2.0 * self.num_draft_layers / num_full_attention
+
+    # ---- capacity: sum state + history parents (not flat full-attn packing) ----
+
+    @override
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        """Parents demanded by all cache groups, capped by the byte budget.
+
+        Flat ``token_limit // (full_packing * P)`` under-counts GDN: each
+        linear-attention state group needs its own LCM parents, and the
+        scheduler admits against the *sum* of per-group demand.
+        """
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        budgeted = self._budgeted_parents(usable_bytes, layout.lcm_block_bytes)
+        if self.token_limit is None:
+            return budgeted
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
+
+    @override
+    def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
+        upper = self.token_limit
+        if upper is None:
+            full_packing = dict(layout.group_packing)[FULL_ATTENTION]
+            upper = num_lcm_blocks * full_packing * layout.prefix_granularity
+        return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
 
     # ---- decoder-layer fields ----
 

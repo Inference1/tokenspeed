@@ -27,10 +27,59 @@
 ``norm(x * gate(z))`` in one Triton launch, with ``silu`` or ``sigmoid`` as
 the gate. Inference only (no backward)."""
 
+from contextlib import nullcontext
+
 import torch
 import triton
 import triton.language as tl
 from tokenspeed_kernel.platform import pdl_enabled
+
+
+def _device_guard(device: torch.device):
+    """Bind launch to the tensor's device; skip CUDA context on Ascend/CPU."""
+    if device.type == "cuda" and device.index is not None:
+        return torch.cuda.device(device.index)
+    if device.type == "npu" and device.index is not None and hasattr(torch, "npu"):
+        return torch.npu.device(device.index)
+    return nullcontext()
+
+
+def _rmsnorm_eager(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    group_size: int | None = None,
+    norm_before_gate: bool = True,
+    sigmoid_gate: bool = False,
+) -> torch.Tensor:
+    """Portable eager path for Ascend / non-CUDA (same math as the Triton kernel)."""
+    x_shape_og = x.shape
+    x = x.reshape(-1, x.shape[-1]).contiguous()
+    if z is not None:
+        z = z.reshape(-1, z.shape[-1]).contiguous()
+    weight = weight.contiguous()
+    n = x.shape[-1]
+    if group_size is None:
+        group_size = n
+    if n % group_size != 0:
+        raise ValueError(f"N={n} must be divisible by group_size={group_size}")
+    ngroups = n // group_size
+    xg = x.view(-1, ngroups, group_size)
+    zg = z.view(-1, ngroups, group_size) if z is not None else None
+    wg = weight.view(ngroups, group_size)
+
+    def _gate(t: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(t) if sigmoid_gate else t * torch.sigmoid(t)
+
+    xf = xg.float()
+    if zg is not None and not norm_before_gate:
+        xf = xf * _gate(zg.float())
+    var = xf.pow(2).mean(dim=-1, keepdim=True)
+    y = xf * torch.rsqrt(var + eps) * wg.float()
+    if zg is not None and norm_before_gate:
+        y = y * _gate(zg.float())
+    return y.to(dtype=x.dtype).reshape(x_shape_og)
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
@@ -93,6 +142,18 @@ def rmsnorm_fn(
     norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z). With
     ``group_size`` set, each group of that many features is normalized on its
     own (``None`` means one group over the whole last dim)."""
+    # Ascend / non-CUDA: avoid torch.cuda.device and CUDA-only Triton extras.
+    if x.device.type != "cuda":
+        return _rmsnorm_eager(
+            x,
+            weight,
+            z=z,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            sigmoid_gate=sigmoid_gate,
+        )
+
     enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
@@ -120,7 +181,7 @@ def rmsnorm_fn(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
-    with torch.cuda.device(x.device.index):
+    with _device_guard(x.device):
         _rms_norm_fwd_kernel[grid](
             x,
             out,

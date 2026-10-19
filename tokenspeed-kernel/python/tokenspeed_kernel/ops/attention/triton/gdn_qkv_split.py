@@ -289,10 +289,37 @@ def fused_qkv_split_gdn_prefill(
     Returns:
         (q, k, v) each shaped ``[1, T, H, D]``.
     """
-    enable_pdl = pdl_enabled()
     if not mixed_qkv.is_contiguous():
         mixed_qkv = mixed_qkv.contiguous()
 
+    # Ascend / non-CUDA: avoid Triton kernels with CUDA PDL extras.
+    if mixed_qkv.device.type != "cuda":
+        seq_len = mixed_qkv.shape[0]
+        q_dim = num_q_heads * head_q
+        k_dim = num_k_heads * head_k
+        v_dim = num_v_heads * head_v
+        q_flat, k_flat, v_flat = mixed_qkv.split([q_dim, k_dim, v_dim], dim=-1)
+        q = q_flat.view(1, seq_len, num_q_heads, head_q)
+        k = k_flat.view(1, seq_len, num_k_heads, head_k)
+        v = v_flat.view(1, seq_len, num_v_heads, head_v)
+        if fuse_l2norm:
+            qf = q.float()
+            kf = k.float()
+            q = (
+                qf * torch.rsqrt(qf.square().sum(dim=-1, keepdim=True).clamp_min(1e-6))
+            ).to(mixed_qkv.dtype)
+            k = (
+                kf * torch.rsqrt(kf.square().sum(dim=-1, keepdim=True).clamp_min(1e-6))
+            ).to(mixed_qkv.dtype)
+        if replay is not None:
+            payload, replay_a, replay_b = replay
+            payload[:, :k_dim].copy_(k_flat)
+            payload[:, k_dim : k_dim + v_dim].copy_(v_flat)
+            payload[:, k_dim + v_dim : k_dim + v_dim + num_v_heads].copy_(replay_a)
+            payload[:, k_dim + v_dim + num_v_heads :].copy_(replay_b)
+        return q, k, v
+
+    enable_pdl = pdl_enabled()
     seq_len = mixed_qkv.shape[0]
     q = torch.empty(
         (1, seq_len, num_q_heads, head_q),

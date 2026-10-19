@@ -461,10 +461,18 @@ class ModelExecutor:
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
+        # On Ascend, RSAG/RoPE torch.compile paths are still brittle during
+        # bring-up; skip so serve can start (decode still works without this).
         if config.enforce_eager:
-            logger.info("Prewarming Triton RSAG communication states")
-            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
-            logger.info("Finished prewarming Triton RSAG communication states")
+            if current_platform().is_npu:
+                logger.info(
+                    "Skipping Triton RSAG prewarm on NPU "
+                    "(Ascend inductor/RoPE not stable yet)"
+                )
+            else:
+                logger.info("Prewarming Triton RSAG communication states")
+                self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+                logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; borrows the decode capture stream so all

@@ -95,8 +95,8 @@ if current_platform().is_npu:
     def mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
 
-    # Torch GDN fallbacks (priority below Triton PORTABLE). Selection prefers
-    # triton_gdn_* once Ascend is included in that capability set.
+    # Torch GDN for Ascend bring-up. Triton gdn_* stay NVIDIA/AMD-only until a
+    # Triton-Ascend GDN path is validated (CUDA-oriented launches SIGSEGV).
     _GDN_TRAITS = {
         "qk_l2norm": frozenset({False, True}),
         "output_h": frozenset({False, True}),
@@ -109,7 +109,7 @@ if current_platform().is_npu:
         solution="torch",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
-        priority=1,
+        priority=Priority.PORTABLE,
         traits=_GDN_TRAITS,
         tags={"portability", "ascend-fallback"},
     )
@@ -128,7 +128,7 @@ if current_platform().is_npu:
         solution="torch",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
-        priority=1,
+        priority=Priority.PORTABLE,
         tags={"portability", "ascend-fallback"},
     )
     def gdn_decode_step(**kwargs):
@@ -141,7 +141,7 @@ if current_platform().is_npu:
         solution="torch",
         capability=_CAPABILITY,
         signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
-        priority=1,
+        priority=Priority.PORTABLE,
         tags={"portability", "speculative-decoding", "ascend-fallback"},
     )
     def gdn_decode_mtp(**kwargs):

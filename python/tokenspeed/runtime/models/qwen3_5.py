@@ -30,10 +30,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import (
-    fused_qk_rmsnorm_rope_gate,
-    qk_rmsnorm,
-)
+from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope_gate
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -769,6 +767,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=config.layer_types[layer_id],
         )
 
         # Dense MLP for non-MoE variant
@@ -837,6 +836,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
+            # Ascend Triton cannot compile fused_qk_rmsnorm_rope_gate
+            # ("ptr type from different source not supported" → segfault in
+            # ttir_to_linalg). Use the unfused path on non-CUDA devices.
+            if q_gate.device.type != "cuda":
+                n_tokens = q_gate.shape[0]
+                q_gate_view = q_gate.view(
+                    n_tokens, self.num_heads, 2, self.head_dim
+                )
+                q = q_gate_view[:, :, 0, :].reshape(n_tokens, -1).contiguous()
+                gate = q_gate_view[:, :, 1, :].reshape(n_tokens, -1).contiguous()
+                q, k = self._apply_qk_norm(q, k)
+                q, k = self.rotary_emb(positions, q, k)
+                return q, k, v, gate
             q, k, gate = fused_qk_rmsnorm_rope_gate(
                 q_gate,
                 k,
@@ -1874,9 +1886,22 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         b: [num_v_heads]
         a: [num_v_heads]
     """
+    total_v = num_heads_v * head_v
+    qkv_dim_t = num_heads_qk * head_qk * 2 + total_v
+    batch = mixed_qkvz.shape[0]
+
+    # Ascend / non-CUDA: avoid Triton kernels with CUDA PDL extras (SIGSEGV).
+    if mixed_qkvz.device.type != "cuda":
+        mixed_qkv = mixed_qkvz[:, :qkv_dim_t].contiguous()
+        z = mixed_qkvz[:, qkv_dim_t : qkv_dim_t + total_v].reshape(
+            batch, num_heads_v, head_v
+        ).contiguous()
+        b = mixed_ba[:, :num_heads_v].contiguous()
+        a = mixed_ba[:, num_heads_v : 2 * num_heads_v].contiguous()
+        return mixed_qkv, z, b, a
+
     enable_pdl = pdl_enabled()
-    batch, seq_len = mixed_qkvz.shape[0], 1
-    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    seq_len = 1
     mixed_qkv = torch.empty(
         [batch * seq_len, qkv_dim_t],
         dtype=mixed_qkvz.dtype,

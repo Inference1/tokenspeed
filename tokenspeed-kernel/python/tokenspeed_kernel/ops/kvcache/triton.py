@@ -418,6 +418,14 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
 
+    # Ascend Triton maps this 2-D launch into a coreDim that can exceed the
+    # 65535 hardware limit (seen as coreDim=98304 on Qwen GDN warmups).
+    # Slice zeroing is correctness-first and avoids the launch constraint.
+    if current_platform().is_npu or backing.device.type == "npu":
+        for offset, size in ranges:
+            backing[offset : offset + size].zero_()
+        return
+
     range_table = (
         torch.tensor(ranges, dtype=torch.int64)
         .pin_memory()

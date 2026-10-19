@@ -47,6 +47,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _platform = current_platform()
 _is_amd = _platform.is_amd
+_is_nvidia = _platform.is_nvidia
 
 
 def _torch_allreduce_residual_rmsnorm(
@@ -257,12 +258,9 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
-            if x.shape[0] == 0:
-                if residual is not None:
-                    return x, residual
-                else:
-                    return x
+        # FlashInfer gemma_* kernels are NVIDIA-only. AMD/Ascend/other use eager
+        # Gemma semantics: y = rmsnorm(x) * (1 + weight).
+        if not _is_nvidia:
             orig_dtype = x.dtype
             if residual is not None:
                 x = x + residual
@@ -274,21 +272,20 @@ class GemmaRMSNorm(torch.nn.Module):
             x = x * (1.0 + self.weight.float())
             x = x.to(orig_dtype)
             return x if residual is None else (x, residual)
-        else:
-            if residual is not None:
-                gemma_fused_add_rmsnorm(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                )
-                return x, residual
-            out = gemma_rmsnorm(
+
+        if residual is not None:
+            gemma_fused_add_rmsnorm(
                 x,
+                residual,
                 self.weight.data,
                 self.variance_epsilon,
             )
-            return out
+            return x, residual
+        return gemma_rmsnorm(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+        )
 
     def forward_with_allreduce_fusion(
         self,

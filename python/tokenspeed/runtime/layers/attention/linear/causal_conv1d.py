@@ -33,6 +33,100 @@ from tokenspeed_kernel.platform import pdl_enabled
 PAD_SLOT_ID = -1
 
 
+def _apply_activation(y: torch.Tensor, activation: str | None) -> torch.Tensor:
+    if activation in ("silu", "swish"):
+        return torch.nn.functional.silu(y)
+    return y
+
+
+def _causal_conv1d_fn_eager(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    activation: str | None,
+    pad_slot_id: int,
+) -> torch.Tensor:
+    """Varlen depthwise causal conv for Ascend / non-CUDA bring-up."""
+    dim, _ = x.shape
+    width = weight.shape[1]
+    state_len = width - 1
+    out = torch.empty_like(x)
+    batch = int(query_start_loc.numel() - 1)
+    starts = query_start_loc.tolist()
+
+    for i in range(batch):
+        if cache_indices is not None:
+            idx = int(cache_indices[i].item())
+            if idx == pad_slot_id:
+                continue
+        else:
+            idx = i
+        start = int(starts[i])
+        end = int(starts[i + 1])
+        if end <= start:
+            continue
+        seq = x[:, start:end]
+        if has_initial_state is not None and bool(has_initial_state[i].item()):
+            hist = conv_states[idx, :, :state_len]
+        else:
+            hist = torch.zeros(
+                dim, state_len, device=x.device, dtype=x.dtype
+            )
+        cat = torch.cat([hist, seq], dim=1)
+        windows = cat.unfold(dimension=1, size=width, step=1)
+        y = (windows * weight.unsqueeze(1)).sum(dim=-1)
+        if bias is not None:
+            y = y + bias.unsqueeze(1)
+        out[:, start:end] = _apply_activation(y, activation)
+        conv_states[idx, :, :state_len] = cat[:, -state_len:]
+    return out
+
+
+def _causal_conv1d_update_eager(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor | None,
+    pad_slot_id: int,
+) -> torch.Tensor:
+    """Single/multi-token decode update for Ascend / non-CUDA bring-up."""
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        x = x.unsqueeze(-1)
+    batch, dim, seqlen = x.shape
+    width = weight.shape[1]
+    state_len = width - 1
+    out = torch.empty_like(x)
+
+    for i in range(batch):
+        if conv_state_indices is not None:
+            idx = int(conv_state_indices[i].item())
+            if idx == pad_slot_id:
+                out[i].zero_()
+                continue
+        else:
+            idx = i
+        hist = conv_state[idx, :, :state_len]
+        seq = x[i]
+        cat = torch.cat([hist, seq], dim=1)
+        windows = cat.unfold(dimension=1, size=width, step=1)
+        y = (windows * weight.unsqueeze(1)).sum(dim=-1)
+        if bias is not None:
+            y = y + bias.unsqueeze(1)
+        out[i] = _apply_activation(y, activation)
+        conv_state[idx, :, :state_len] = cat[:, -state_len:]
+
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out
+
+
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -456,9 +550,22 @@ def causal_conv1d_fn(
 
     out: same shape as `x`
     """
-    enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
+    if x.device.type != "cuda":
+        return _causal_conv1d_fn_eager(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            activation,
+            pad_slot_id,
+        )
+
+    enable_pdl = pdl_enabled()
 
     out = torch.empty_like(x)
     seq_lens_cpu = kwargs.get("seq_lens_cpu")
@@ -951,15 +1058,26 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+    if x.device.type != "cuda":
+        return _causal_conv1d_update_eager(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            pad_slot_id,
+        )
+
     enable_pdl = pdl_enabled()
     if validate_data:
         assert cache_seqlens is None
         assert pad_slot_id is not None
         assert x.stride(1) == 1
-    if isinstance(activation, bool):
-        activation = "silu" if activation is True else None
-    elif activation is not None:
-        assert activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1

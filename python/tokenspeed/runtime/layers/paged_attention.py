@@ -57,6 +57,8 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        *,
+        group_id: str | None = None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -79,8 +81,8 @@ class PagedAttention(nn.Module):
         self.sliding_window_size = int(sliding_window_size)
         # Storage: the cache group this layer's KV rides. Owned by the cache
         # plan and bound at startup (bind_cache_groups); the model never
-        # names it.
-        self._group_id: str | None = None
+        # names it. Some trees pass group_id at construction (Ascend server).
+        self._group_id: str | None = group_id
         self.k_scale = None
         self.v_scale = None
 
