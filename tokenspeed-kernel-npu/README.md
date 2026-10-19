@@ -4,8 +4,11 @@ TokenSpeed-Kernel-NPU contains the Ascend-specific operators used by
 TokenSpeed. Keeping these implementations in a standalone package mirrors the
 AMD package layout and keeps the TokenSpeed runtime vendor-neutral.
 
-The initial Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary
-embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
+The Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary embedding,
+Torch GDN fallbacks for hybrid Qwen3.5/3.8 layers, and the Triton-Ascend
+import adapter required by CANN 8.5.1 / 9.0.0. Portable Triton GDN kernels in
+`tokenspeed-kernel` also advertise the Ascend vendor so Triton-Ascend can win
+over the Torch fallback when it compiles.
 
 For development from this repository:
 

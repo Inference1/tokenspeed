@@ -26,6 +26,8 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_npu:
+    from tokenspeed_kernel.ops.attention import GdnChunkPrefillResult
+    from tokenspeed_kernel_npu.ops import gdn as _gdn
     from tokenspeed_kernel_npu.ops.mha import (
         mha_decode_with_kvcache as _mha_decode_with_kvcache,
     )
@@ -93,8 +95,63 @@ if current_platform().is_npu:
     def mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
 
+    # Torch GDN fallbacks (priority below Triton PORTABLE). Selection prefers
+    # triton_gdn_* once Ascend is included in that capability set.
+    _GDN_TRAITS = {
+        "qk_l2norm": frozenset({False, True}),
+        "output_h": frozenset({False, True}),
+    }
+
+    @register_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        name="ascend_torch_gdn_chunk_prefill",
+        solution="torch",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=1,
+        traits=_GDN_TRAITS,
+        tags={"portability", "ascend-fallback"},
+    )
+    def gdn_chunk_prefill(**kwargs):
+        result = _gdn.gdn_chunk_prefill(**kwargs)
+        return GdnChunkPrefillResult(
+            out=result.out,
+            final_state=result.final_state,
+            h=result.h,
+        )
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_step",
+        name="ascend_torch_gdn_decode_step",
+        solution="torch",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=1,
+        tags={"portability", "ascend-fallback"},
+    )
+    def gdn_decode_step(**kwargs):
+        return _gdn.gdn_decode_step(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        name="ascend_torch_gdn_decode_mtp",
+        solution="torch",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=1,
+        tags={"portability", "speculative-decoding", "ascend-fallback"},
+    )
+    def gdn_decode_mtp(**kwargs):
+        return _gdn.gdn_decode_mtp(**kwargs)
+
 
 __all__ = [
+    "gdn_chunk_prefill",
+    "gdn_decode_mtp",
+    "gdn_decode_step",
     "mha_decode_with_kvcache",
     "mha_extend_with_kvcache",
     "mha_prefill",

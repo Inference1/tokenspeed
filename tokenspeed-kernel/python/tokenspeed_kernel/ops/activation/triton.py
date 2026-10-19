@@ -180,6 +180,10 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
     The strided form lets callers skip the ``.reshape(-1)`` copy after the
     chunk; both layouts share the same kernel via the explicit gate strides.
+
+    On Ascend NPU the fused Triton path is skipped in favour of an eager
+    PyTorch implementation so Qwen3.5/3.8 gated full-attention remains correct
+    without a dedicated Triton-Ascend fuse.
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -198,6 +202,7 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         head_dim = hidden_dim
         gate_row_stride = gate.stride(0)
         gate_head_stride = hidden_dim
+        gate_for_eager = gate
     elif gate.ndim == 3:
         gate_tokens, num_heads, head_dim = gate.shape
         if gate_tokens != num_tokens:
@@ -208,11 +213,18 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
             )
         gate_row_stride = gate.stride(0)
         gate_head_stride = gate.stride(1)
+        gate_for_eager = gate.reshape(num_tokens, hidden_dim)
     else:
         raise ValueError(f"gate must be 2D or 3D, got {gate.ndim}D")
 
     n = x.numel()
     if n == 0:
+        return x
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().is_npu:
+        x.mul_(torch.sigmoid(gate_for_eager))
         return x
 
     BLOCK_SIZE = 1024
