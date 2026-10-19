@@ -741,12 +741,15 @@ python -m tokenspeed.cli serve /path/to/Qwen3.8-27B \
   `max_tokens≥256` → `ascend_expect_accuracy=1.0` (7/7); see
   `docs/platforms/ascend_qwen38_dataset_qa.md`
 - EvalScope **AIME-2025** (`aime25`, `--limit 5`, `max_tokens=2048`,
-  `temperature=0`, greedy): **Accuracy 60%** (3/5). Avg latency ~1004 s/item
-  at ~1.3–1.7 tok/s under `--enforce-eager`. Shorter `max_tokens=256` truncates
-  thinking and scored **0%** — not a fair accuracy run.
-- EvalScope **GPQA Diamond**: same harness (`scripts/ascend_qwen38_evalscope_bench.sh`
-  or ModelScope `AI-ModelScope/gpqa_diamond`); long runs — prefer `tmux` and
-  `--timeout 3600`. Lab score pending a full uninterrupted pass.
+  `temperature=0`, greedy, `--timeout 3600`): **Accuracy 60%** (3/5). Avg
+  latency ~1004 s/item at ~1.3–1.7 tok/s under `--enforce-eager`. Shorter
+  `max_tokens=256` truncates thinking and scored **0%** — not a fair accuracy
+  run.
+- EvalScope **GPQA Diamond** (`gpqa_diamond`, ModelScope
+  `AI-ModelScope/gpqa_diamond`, `--limit 10`, `max_tokens=2048`,
+  `--timeout 3600`): **Accuracy 60%** (6/10). Wall time ~2 h 45 m; avg
+  latency ~989 s/item, ~1.44 tok/s, avg out ~1428 tokens. Prefer `tmux` for
+  long runs. These are small-N smoke scores, not a full-suite claim.
 
 Notes:
 - Prefer `--world-size` (not the NVIDIA FP8 recipe’s single-GPU MTP stack).
