@@ -95,12 +95,60 @@ if current_platform().is_npu:
     def mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
 
-    # Torch GDN for Ascend bring-up. Triton gdn_* stay NVIDIA/AMD-only until a
-    # Triton-Ascend GDN path is validated (CUDA-oriented launches SIGSEGV).
+    # GDN: prefer CANN / vectorized Ascend path (vLLM-Ascend-inspired). Keep
+    # the original token-loop Torch kernels as a portable fallback. Triton
+    # gdn_* stay NVIDIA/AMD-only (CUDA launches SIGSEGV on Ascend).
+    from tokenspeed_kernel_npu.ops import gdn_npu as _gdn_npu
+
     _GDN_TRAITS = {
         "qk_l2norm": frozenset({False, True}),
         "output_h": frozenset({False, True}),
     }
+
+    @register_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        name="ascend_npu_gdn_chunk_prefill",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT + 2,
+        traits=_GDN_TRAITS,
+        tags={"portability", "ascend-perf"},
+    )
+    def gdn_chunk_prefill_npu(**kwargs):
+        result = _gdn_npu.gdn_chunk_prefill(**kwargs)
+        return GdnChunkPrefillResult(
+            out=result.out,
+            final_state=result.final_state,
+            h=result.h,
+        )
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_step",
+        name="ascend_npu_gdn_decode_step",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT + 2,
+        tags={"portability", "ascend-perf"},
+    )
+    def gdn_decode_step_npu(**kwargs):
+        return _gdn_npu.gdn_decode_step(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        name="ascend_npu_gdn_decode_mtp",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures(("q", "k", "v"), "dense", _DTYPES),
+        priority=Priority.PERFORMANT + 2,
+        tags={"portability", "speculative-decoding", "ascend-perf"},
+    )
+    def gdn_decode_mtp_npu(**kwargs):
+        return _gdn_npu.gdn_decode_mtp(**kwargs)
 
     @register_kernel(
         "attention",

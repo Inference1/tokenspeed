@@ -4,9 +4,19 @@
 
 | Script | Role |
 |--------|------|
-| `ascend_qwen38_smoke.sh` | Patch checks + optional `--serve` |
-| `ascend_qwen38_verify_chat.sh` | HTTP models + chat smoke (`PORT=31891`) |
+| `ascend_qwen38_smoke.sh` | Patch checks + optional `--serve` (`ASCEND_ALLOW_GRAPH=1` 可去掉 `--enforce-eager`) |
+| `ascend_qwen38_verify_chat.sh` | HTTP models + chat smoke（`PORT=31911` 当前 vLLM；`31891` TokenSpeed） |
 | `ascend_qwen38_bench_http.sh` | E2E latency / tok-s (not accuracy) |
+
+Perf A/B（勿占用正在跑 AIME 的 31891）:
+
+```bash
+PORT=31901 ASCEND_ALLOW_GRAPH=0 bash scripts/ascend_qwen38_smoke.sh --serve
+PORT=31901 bash scripts/ascend_qwen38_bench_http.sh
+# 另卡 / 另会话:
+PORT=31902 ASCEND_ALLOW_GRAPH=1 bash scripts/ascend_qwen38_smoke.sh --serve
+PORT=31902 bash scripts/ascend_qwen38_bench_http.sh
+```
 
 Model path on lab:
 
@@ -51,8 +61,10 @@ bash scripts/ascend_qwen38_accuracy.sh \
 | `gpqa_diamond` | `Idavidrein/gpqa` subset `gpqa_diamond` | 198 | 20 |
 
 ```bash
-# serve 已在 31891
-PORT=31891 bash scripts/ascend_qwen38_evalscope_bench.sh
+# 进容器: nsenter -t $(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev) -m -u -i -n -p bash
+# 当前 vLLM serve 在 31911（TokenSpeed 则用 31891）
+PORT=31911 bash scripts/ascend_qwen38_evalscope_bench.sh
+# PORT=31891 bash scripts/ascend_qwen38_evalscope_bench.sh
 
 # 只跑更小子集
 DATASETS=aime25 LIMIT_AIME=5 bash scripts/ascend_qwen38_evalscope_bench.sh

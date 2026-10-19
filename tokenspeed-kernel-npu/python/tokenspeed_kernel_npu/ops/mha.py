@@ -28,10 +28,12 @@ import torch
 import torch_npu
 
 # Ascend FusedInferAttentionScore TND layout only accepts these head dims
-# (or Q/K=192 with V=128). Qwen3.5/3.8 full-attn uses head_dim=256.
+# (or Q/K=192 with V=128). Qwen3.5/3.8 full-attn uses head_dim=256 — try BNSD
+# FIA (vLLM-Ascend layout switch) before falling back to eager matmul.
 _TND_SUPPORTED_HEAD_DIMS = frozenset({64, 128, 192})
 
 _CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
+_BNSD_256_OK: bool | None = None
 
 
 def _causal_mask(device: torch.device) -> torch.Tensor:
@@ -66,7 +68,74 @@ def _check_options(
 
 
 def _needs_eager(q: torch.Tensor) -> bool:
-    return int(q.shape[-1]) not in _TND_SUPPORTED_HEAD_DIMS
+    """True when no fused FIA path should be attempted for this head dim."""
+    d = int(q.shape[-1])
+    if d in _TND_SUPPORTED_HEAD_DIMS:
+        return False
+    # D=256: attempt BNSD fused; only force eager if probe failed.
+    if d == 256:
+        return _BNSD_256_OK is False
+    return True
+
+
+def _probe_bnsd_256(device: torch.device) -> bool:
+    global _BNSD_256_OK
+    if _BNSD_256_OK is not None:
+        return _BNSD_256_OK
+    try:
+        h, s, d = 2, 8, 256
+        q = torch.zeros(1, h, s, d, device=device, dtype=torch.bfloat16)
+        k = torch.zeros(1, 1, s, d, device=device, dtype=torch.bfloat16)
+        v = torch.zeros(1, 1, s, d, device=device, dtype=torch.bfloat16)
+        torch_npu.npu_fused_infer_attention_score(
+            q,
+            k,
+            v,
+            num_heads=h,
+            num_key_value_heads=1,
+            scale=d**-0.5,
+            input_layout="BNSD",
+            pre_tokens=65535,
+            next_tokens=0,
+        )
+        torch.npu.synchronize()
+        _BNSD_256_OK = True
+    except Exception:
+        _BNSD_256_OK = False
+    return _BNSD_256_OK
+
+
+def _bnsd_seq_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Single-sequence fused attention via BNSD layout. Inputs ``[L,H,D]``."""
+    if not _probe_bnsd_256(q.device):
+        return _eager_seq_attn(q, k, v, scale=scale, causal=causal)
+    # [1, H, L, D]
+    q_b = q.transpose(0, 1).unsqueeze(0).contiguous()
+    k_b = k.transpose(0, 1).unsqueeze(0).contiguous()
+    v_b = v.transpose(0, 1).unsqueeze(0).contiguous()
+    try:
+        out, _ = torch_npu.npu_fused_infer_attention_score(
+            q_b,
+            k_b,
+            v_b,
+            num_heads=q.shape[1],
+            num_key_value_heads=k.shape[1],
+            scale=scale,
+            input_layout="BNSD",
+            pre_tokens=65535,
+            next_tokens=0 if causal else 65535,
+        )
+        # out: [1, H, L, D] -> [L, H, D]
+        return out.squeeze(0).transpose(0, 1).contiguous().to(q.dtype)
+    except Exception:
+        return _eager_seq_attn(q, k, v, scale=scale, causal=causal)
 
 
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -142,6 +211,26 @@ def _gather_paged_kv(
     return k, v
 
 
+def _fused_or_eager_prefill_256(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    scale: float,
+) -> torch.Tensor:
+    outs: list[torch.Tensor] = []
+    for i in range(len(cu_seqlens_cpu) - 1):
+        s, e = int(cu_seqlens_cpu[i]), int(cu_seqlens_cpu[i + 1])
+        if e <= s:
+            continue
+        outs.append(
+            _bnsd_seq_attn(q[s:e], k[s:e], v[s:e], scale=scale, causal=True)
+        )
+    if not outs:
+        return torch.empty_like(q)
+    return torch.cat(outs, dim=0)
+
+
 def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -164,6 +253,8 @@ def mha_prefill(
         return_lse=return_lse,
     )
     scale = _scale(q, softmax_scale)
+    if int(q.shape[-1]) == 256:
+        return _fused_or_eager_prefill_256(q, k, v, cu_seqlens_cpu, scale)
     if _needs_eager(q):
         return _eager_mha_prefill(q, k, v, cu_seqlens_cpu, scale)
 
@@ -216,7 +307,7 @@ def mha_extend_with_kvcache(
         raise NotImplementedError("Ascend MHA does not support scaled FP8 cache")
 
     scale = _scale(q, softmax_scale)
-    if _needs_eager(q):
+    if int(q.shape[-1]) == 256 or _needs_eager(q):
         cu_q = cu_seqlens_q.tolist()
         cache_lens = cache_seqlens.tolist()
         outs: list[torch.Tensor] = []
@@ -225,9 +316,14 @@ def mha_extend_with_kvcache(
             kv_len = int(cache_lens[i])
             qi = q[qs:qe]
             ki, vi = _gather_paged_kv(k_cache, v_cache, page_table[i], kv_len)
-            outs.append(
-                _eager_seq_attn(qi, ki, vi, scale=scale, causal=is_causal)
-            )
+            if int(q.shape[-1]) == 256:
+                outs.append(
+                    _bnsd_seq_attn(qi, ki, vi, scale=scale, causal=is_causal)
+                )
+            else:
+                outs.append(
+                    _eager_seq_attn(qi, ki, vi, scale=scale, causal=is_causal)
+                )
         return torch.cat(outs, dim=0) if outs else torch.empty_like(q)
 
     output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -282,7 +378,7 @@ def mha_decode_with_kvcache(
     scale = _scale(q, softmax_scale)
     batch_size = cache_seqlens.shape[0]
 
-    if _needs_eager(q):
+    if int(q.shape[-1]) == 256 or _needs_eager(q):
         # q: [B, H, D] or [B, 1, H, D] depending on caller; normalize to [1,H,D] per row.
         if q.ndim == 3:
             q_rows = q
@@ -295,7 +391,14 @@ def mha_decode_with_kvcache(
             ki, vi = _gather_paged_kv(
                 k_cache, v_cache, page_table[i], int(cache_lens[i])
             )
-            outs.append(_eager_seq_attn(qi, ki, vi, scale=scale, causal=False))
+            if int(q.shape[-1]) == 256:
+                outs.append(
+                    _bnsd_seq_attn(qi, ki, vi, scale=scale, causal=False)
+                )
+            else:
+                outs.append(
+                    _eager_seq_attn(qi, ki, vi, scale=scale, causal=False)
+                )
         return torch.cat(outs, dim=0).reshape_as(q)
 
     actual_seq_lengths_kv = (

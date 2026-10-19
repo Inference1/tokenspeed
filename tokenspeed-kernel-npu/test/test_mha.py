@@ -62,11 +62,12 @@ def _paged_rows(
     return pages[:length]
 
 
-def test_mha_prefill() -> None:
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_mha_prefill(head_dim: int) -> None:
     lengths = [3, 5]
     cumulative = torch.tensor([0, 3, 8], dtype=torch.int32, device="npu")
-    q = torch.randn(8, 4, 64, dtype=torch.bfloat16, device="npu")
-    k = torch.randn(8, 2, 64, dtype=torch.bfloat16, device="npu")
+    q = torch.randn(8, 4, head_dim, dtype=torch.bfloat16, device="npu")
+    k = torch.randn(8, 2, head_dim, dtype=torch.bfloat16, device="npu")
     v = torch.randn_like(k)
 
     output = mha_prefill(q, k, v, cumulative, [0, 3, 8], 5)
@@ -78,6 +79,23 @@ def test_mha_prefill() -> None:
     )
 
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_mha_prefill_256_bnsd_or_eager() -> None:
+    """head_dim=256 must return correct shapes via BNSD FIA or eager fallback."""
+    from tokenspeed_kernel_npu.ops import mha as mha_mod
+
+    q = torch.randn(6, 2, 256, dtype=torch.bfloat16, device="npu")
+    k = torch.randn(6, 1, 256, dtype=torch.bfloat16, device="npu")
+    v = torch.randn_like(k)
+    out = mha_prefill(
+        q, k, v, torch.tensor([0, 6], device="npu", dtype=torch.int32), [0, 6], 6
+    )
+    assert out.shape == q.shape
+    # After first call the probe should be resolved (True or False, not None).
+    assert mha_mod._BNSD_256_OK is not None
+    expected = _attention(q, k, v, causal=True)
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
 
 
 def test_mha_extend_with_paged_cache() -> None:
