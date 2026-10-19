@@ -4,16 +4,16 @@
 
 | Script | Role |
 |--------|------|
-| `ascend_qwen38_smoke.sh` | Patch checks + optional `--serve` (`ASCEND_ALLOW_GRAPH=1` 可去掉 `--enforce-eager`) |
-| `ascend_qwen38_verify_chat.sh` | HTTP models + chat smoke（`PORT=31911` 当前 vLLM；`31891` TokenSpeed） |
-| `ascend_qwen38_bench_http.sh` | E2E latency / tok-s (not accuracy) |
+| `ascend_qwen38_smoke.sh` | Patch checks + optional `--serve` (`ASCEND_ALLOW_GRAPH=1` drops `--enforce-eager`) |
+| `ascend_qwen38_verify_chat.sh` | HTTP `/v1/models` + chat smoke (`PORT=31911` = current vLLM; `31891` = TokenSpeed) |
+| `ascend_qwen38_bench_http.sh` | E2E latency / tok/s (not accuracy) |
 
-Perf A/B（勿占用正在跑 AIME 的 31891）:
+Perf A/B (use a free port; do not collide with a long accuracy job on 31891/31911):
 
 ```bash
 PORT=31901 ASCEND_ALLOW_GRAPH=0 bash scripts/ascend_qwen38_smoke.sh --serve
 PORT=31901 bash scripts/ascend_qwen38_bench_http.sh
-# 另卡 / 另会话:
+# Other NPUs / other session:
 PORT=31902 ASCEND_ALLOW_GRAPH=1 bash scripts/ascend_qwen38_smoke.sh --serve
 PORT=31902 bash scripts/ascend_qwen38_bench_http.sh
 ```
@@ -51,29 +51,32 @@ bash scripts/ascend_qwen38_accuracy.sh \
   --out /tmp/qwen38_acc_compare.json
 ```
 
-## Item 2 — EvalScope AIME25 + GPQA Diamond（与 CI 同数据集）
+## Item 2 — EvalScope AIME25 + GPQA Diamond (CI-aligned datasets)
 
-与 `test/ci/eval/*-evalscope-aime25.yaml` / `*-gpqa-diamond.yaml` 对齐：
+Aligned with `test/ci/eval/*-evalscope-aime25.yaml` / `*-gpqa-diamond.yaml`:
 
-| Dataset | Hub id | 全量约 | 默认 limit（小跑） |
-|---------|--------|--------|-------------------|
+| Dataset | Hub id | Full size (approx.) | Default small limit |
+|---------|--------|---------------------|---------------------|
 | `aime25` | `math-ai/aime25` | 30 | 10 |
 | `gpqa_diamond` | `Idavidrein/gpqa` subset `gpqa_diamond` | 198 | 20 |
 
 ```bash
-# 进容器: nsenter -t $(docker inspect -f '{{.State.Pid}}' vllm_ascend_dev) -m -u -i -n -p bash
-# 当前 vLLM serve 在 31911（TokenSpeed 则用 31891）
+# Enter container, then:
+# Current vLLM serve is on 31911 (TokenSpeed historically used 31891)
 PORT=31911 bash scripts/ascend_qwen38_evalscope_bench.sh
 # PORT=31891 bash scripts/ascend_qwen38_evalscope_bench.sh
 
-# 只跑更小子集
+# Smaller subsets
 DATASETS=aime25 LIMIT_AIME=5 bash scripts/ascend_qwen38_evalscope_bench.sh
 DATASETS=gpqa_diamond LIMIT_GPQA=10 bash scripts/ascend_qwen38_evalscope_bench.sh
 
-# HF 拉不了 GPQA 时改 ModelScope
+# If Hugging Face is unreachable for GPQA, use ModelScope
 GPQA_HUB=modelscope DATASETS=gpqa_diamond bash scripts/ascend_qwen38_evalscope_bench.sh
 ```
 
-结果目录默认：`/tmp/qwen38_evalscope/{dataset}_limitN/`。注意当前 serve 多为 `max-model-len=4096`，脚本默认 `MAX_TOKENS=1024`；AIME 长推理不够可酌情加大并相应提高 `max-model-len`。
+Results default to `/tmp/qwen38_evalscope/{dataset}_limitN/`. Many older serves used
+`max-model-len=4096` with script default `MAX_TOKENS=1024`. For long thinking AIME/GPQA,
+raise both (lab AISBench path uses `max-model-len=131072` and `max_out_len=32768`).
 
-Bring-up notes + screenshot checklist: `docs/platforms/ascend_qwen38_sync.md`.
+For full-suite AISBench numbers and protocol notes, see `docs/recipes/models.md` and
+`docs/platforms/ascend_qwen38_sync.md`.

@@ -743,16 +743,15 @@ python -m tokenspeed.cli serve /path/to/Qwen3.8-27B \
 - Custom accuracy jsonl (`scripts/data/qwen38_accuracy_prompts.jsonl`) with
   `max_tokens≥256` → `ascend_expect_accuracy=1.0` (7/7); see
   `docs/platforms/ascend_qwen38_dataset_qa.md`
-- EvalScope **AIME-2025** (`aime25`, `--limit 5`, `max_tokens=2048`,
-  `temperature=0`, greedy, `--timeout 3600`): **Accuracy 60%** (3/5). Avg
-  latency ~1004 s/item at ~1.3–1.7 tok/s under `--enforce-eager`. Shorter
-  `max_tokens=256` truncates thinking and scored **0%** — not a fair accuracy
-  run.
-- EvalScope **GPQA Diamond** (`gpqa_diamond`, ModelScope
-  `AI-ModelScope/gpqa_diamond`, `--limit 10`, `max_tokens=2048`,
-  `--timeout 3600`): **Accuracy 60%** (6/10). Wall time ~2 h 45 m; avg
-  latency ~989 s/item, ~1.44 tok/s, avg out ~1428 tokens. Prefer `tmux` for
-  long runs. These are small-N smoke scores, not a full-suite claim.
+- Early EvalScope smokes (`aime25`/`gpqa_diamond`, small `--limit`, short
+  `max_tokens`) reported ~60% — protocol-limited, not the aligned full suite.
+- **AISBench full suite on vLLM-Ascend** (lab, 2026-09-27/28): serve
+  `max-model-len=131072`, client `max_out_len=32768`,
+  `reasoning_effort=xhigh` (request top-level), thinking enabled —
+  **GPQA Diamond `gpqa_gen_0_shot_str` → 87.88%**;
+  **AIME2025 `aime2025_gen_0_shot_chat_prompt` → 90.00%**.
+  Official vLLM-Ascend reference table cites GPQA ~90.40; remaining gap is
+  environment/protocol residual, not a failed run.
 
 Notes:
 - Prefer `--world-size` (not the NVIDIA FP8 recipe’s single-GPU MTP stack).
